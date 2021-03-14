@@ -11,6 +11,11 @@
 #include <string.h>
 #include <errno.h>
 
+#ifdef VIRTIO_SOCKETPAIR_BROKER
+#include <socketpair-broker/helper.h>
+#endif
+
+
 #include <rte_alarm.h>
 #include <rte_string_fns.h>
 #include <rte_fbarray.h>
@@ -21,6 +26,7 @@
 struct vhost_user_data {
 	int vhostfd;
 	int listenfd;
+	int brokerfd;
 	uint64_t protocol_features;
 };
 
@@ -790,12 +796,78 @@ vhost_user_server_disconnect(struct virtio_user_dev *dev)
 	return 0;
 }
 
+static void
+vhost_user_update_broker_fd(struct virtio_user_dev *dev __rte_unused)
+{
+#ifdef VIRTIO_SOCKETPAIR_BROKER
+	struct vhost_user_data *data = dev->backend_data;
+	char *err = NULL;
+	int flags;
+
+	if (data->brokerfd != -1)
+		return;
+
+	data->brokerfd = sp_broker_connect(dev->path, false, &err);
+	if (data->brokerfd < 0) {
+		PMD_DRV_LOG(WARNING, "failed to connect to broker: %s", err);
+		free(err);
+		data->brokerfd = -1;
+		return;
+	}
+
+	if (sp_broker_send_get_pair(data->brokerfd, dev->broker_key,
+				    dev->is_server, &err)) {
+		PMD_DRV_LOG(WARNING,
+			    "failed to send GET_PAIR request: %s", err);
+		free(err);
+		close(data->brokerfd);
+		data->brokerfd = -1;
+		return;
+	}
+
+	flags = fcntl(data->brokerfd, F_GETFL);
+	if (fcntl(data->brokerfd, F_SETFL, flags | O_NONBLOCK) == -1) {
+		PMD_DRV_LOG(ERR, "error setting O_NONBLOCK flag");
+		close(data->brokerfd);
+		data->brokerfd = -1;
+		return;
+	}
+#endif
+}
+
 static int
 vhost_user_server_reconnect(struct virtio_user_dev *dev)
 {
 	struct vhost_user_data *data = dev->backend_data;
 	int fd;
 
+#ifdef VIRTIO_SOCKETPAIR_BROKER
+	if (dev->broker_key) {
+		char *err;
+
+		vhost_user_update_broker_fd(dev);
+		if (data->brokerfd == -1)
+			return -1;
+
+		fd = sp_broker_receive_set_pair(data->brokerfd, &err);
+		if (fd < 0) {
+			PMD_DRV_LOG(DEBUG,
+				    "failed to receive SET_PAIR: %s", err);
+			free(err);
+			/*
+			 * Unfortunately, since connection is non-blocking
+			 * we can't reliably say if the other end is dead for
+			 * a case where it didn't close the socket gracefully.
+			 * Closing current connection to re-establish later.
+			 */
+			close(data->brokerfd);
+			data->brokerfd = -1;
+			return -1;
+		}
+		data->vhostfd = fd;
+		return 0;
+	}
+#endif
 	fd = accept(data->listenfd, NULL, NULL);
 	if (fd < 0)
 		return -1;
@@ -832,6 +904,29 @@ vhost_user_setup(struct virtio_user_dev *dev)
 
 	data->vhostfd = -1;
 	data->listenfd = -1;
+	data->brokerfd = -1;
+
+	if (dev->broker_key) {
+#ifdef VIRTIO_SOCKETPAIR_BROKER
+		char *err;
+
+		fd = sp_broker_get_pair(dev->path, dev->broker_key,
+					dev->is_server, &err);
+		if (fd < 0) {
+			PMD_DRV_LOG(ERR,
+				"virtio-user failed to connect to broker: %s",
+				err);
+			free(err);
+			goto err_data;
+		}
+		data->vhostfd = fd;
+		return 0;
+#else
+		PMD_DRV_LOG(ERR, "virtio-user broker connection requested "
+				 "but not compiled");
+		goto err_data;
+#endif
+	}
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -888,6 +983,11 @@ vhost_user_destroy(struct virtio_user_dev *dev)
 	if (data->listenfd >= 0) {
 		close(data->listenfd);
 		data->listenfd = -1;
+	}
+
+	if (data->brokerfd >= 0) {
+		close(data->brokerfd);
+		data->brokerfd = -1;
 	}
 
 	free(data);
@@ -983,8 +1083,22 @@ vhost_user_get_intr_fd(struct virtio_user_dev *dev)
 {
 	struct vhost_user_data *data = dev->backend_data;
 
-	if (dev->is_server && data->vhostfd == -1)
-		return data->listenfd;
+	if (data->vhostfd == -1) {
+		if (dev->broker_key) {
+			vhost_user_update_broker_fd(dev);
+			return data->brokerfd;
+		}
+		if (dev->is_server)
+			return data->listenfd;
+	} else if (data->brokerfd != -1) {
+		/*
+		 * Broker not needed anymore and we need to close the socket
+		 * because other end will be closed by the broker anyway.
+		 */
+		PMD_DRV_LOG(DEBUG, "Closing broker fd: %d", data->brokerfd);
+		close(data->brokerfd);
+		data->brokerfd = -1;
+	}
 
 	return data->vhostfd;
 }

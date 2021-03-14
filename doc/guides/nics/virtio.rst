@@ -377,6 +377,11 @@ Below devargs are supported by the virtio-user vdev:
 
     It is used to specify a path to connect to vhost backend.
 
+#.  ``broker-key``:
+
+    It is used to specify that ``path`` points to a SocketPair Broker, value
+    is used as a pairing key.
+
 #.  ``mac``:
 
     It is used to specify the MAC address.

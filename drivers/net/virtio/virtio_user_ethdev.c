@@ -315,6 +315,8 @@ static const char *valid_args[] = {
 	VIRTIO_USER_ARG_SPEED,
 #define VIRTIO_USER_ARG_VECTORIZED     "vectorized"
 	VIRTIO_USER_ARG_VECTORIZED,
+#define VIRTIO_USER_ARG_BROKER_KEY     "broker-key"
+	VIRTIO_USER_ARG_BROKER_KEY,
 	NULL
 };
 
@@ -467,6 +469,7 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 	uint64_t packed_vq = 0;
 	uint64_t vectorized = 0;
 	char *path = NULL;
+	char *broker_key = NULL;
 	char *ifname = NULL;
 	char *mac_addr = NULL;
 	int ret = -1;
@@ -578,6 +581,28 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 		}
 	}
 
+	if (rte_kvargs_count(kvlist, VIRTIO_USER_ARG_BROKER_KEY) == 1) {
+#ifndef VIRTIO_SOCKETPAIR_BROKER
+		PMD_INIT_LOG(ERR,
+			"arg %s requested but support for SocketPair Broker "
+			"is not compiled",
+			VIRTIO_USER_ARG_BROKER_KEY);
+		goto end;
+#endif
+		if (backend_type != VIRTIO_USER_BACKEND_VHOST_USER) {
+			PMD_INIT_LOG(ERR,
+				"arg %s applies only to vhost-user backend",
+				VIRTIO_USER_ARG_BROKER_KEY);
+			goto end;
+		}
+		if (rte_kvargs_process(kvlist, VIRTIO_USER_ARG_BROKER_KEY,
+				       &get_string_arg, &broker_key) < 0) {
+			PMD_INIT_LOG(ERR, "error to parse %s",
+				     VIRTIO_USER_ARG_BROKER_KEY);
+			goto end;
+		}
+	}
+
 	if (rte_kvargs_count(kvlist, VIRTIO_USER_ARG_CQ_NUM) == 1) {
 		if (rte_kvargs_process(kvlist, VIRTIO_USER_ARG_CQ_NUM,
 				       &get_integer_arg, &cq) < 0) {
@@ -645,7 +670,7 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 
 	dev = eth_dev->data->dev_private;
 	hw = &dev->hw;
-	if (virtio_user_dev_init(dev, path, queues, cq,
+	if (virtio_user_dev_init(dev, path, &broker_key, queues, cq,
 			 queue_size, mac_addr, &ifname, server_mode,
 			 mrg_rxbuf, in_order, packed_vq, backend_type) < 0) {
 		PMD_INIT_LOG(ERR, "virtio_user_dev_init fails");
@@ -682,6 +707,8 @@ end:
 		rte_kvargs_free(kvlist);
 	if (path)
 		free(path);
+	if (broker_key)
+		free(broker_key);
 	if (mac_addr)
 		free(mac_addr);
 	if (ifname)
@@ -777,6 +804,7 @@ RTE_PMD_REGISTER_PARAM_STRING(net_virtio_user,
 	"queue_size=<int> "
 	"queues=<int> "
 	"iface=<string> "
+	"broker_key=<string> "
 	"server=<0|1> "
 	"mrg_rxbuf=<0|1> "
 	"in_order=<0|1> "

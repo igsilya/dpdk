@@ -7,6 +7,12 @@ if is_windows
     subdir_done()
 endif
 
+spbroker_dep = dependency('spbroker', required: false)
+if spbroker_dep.found()
+    dpdk_conf.set('VIRTIO_SOCKETPAIR_BROKER', 1)
+    ext_deps += spbroker_dep
+endif
+
 sources += files(
         'virtio.c',
         'virtio_ethdev.c',

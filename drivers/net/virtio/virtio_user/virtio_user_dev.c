@@ -414,11 +414,16 @@ exit:
 static int
 virtio_user_dev_setup(struct virtio_user_dev *dev)
 {
-	if (dev->is_server) {
-		if (dev->backend_type != VIRTIO_USER_BACKEND_VHOST_USER) {
-			PMD_DRV_LOG(ERR, "Server mode only supports vhost-user!");
-			return -1;
-		}
+	if (dev->is_server &&
+	    dev->backend_type != VIRTIO_USER_BACKEND_VHOST_USER) {
+		PMD_DRV_LOG(ERR, "Server mode only supports vhost-user!");
+		return -1;
+	}
+
+	if (dev->broker_key &&
+	    dev->backend_type != VIRTIO_USER_BACKEND_VHOST_USER) {
+		PMD_DRV_LOG(ERR, "Broker connection only supports vhost-user!");
+		return -1;
 	}
 
 	switch (dev->backend_type) {
@@ -483,10 +488,10 @@ destroy:
 	 1ULL << VIRTIO_F_RING_PACKED)
 
 int
-virtio_user_dev_init(struct virtio_user_dev *dev, char *path, int queues,
-		     int cq, int queue_size, const char *mac, char **ifname,
-		     int server, int mrg_rxbuf, int in_order, int packed_vq,
-		     enum virtio_user_backend_type backend_type)
+virtio_user_dev_init(struct virtio_user_dev *dev, char *path, char **broker_key,
+		     int queues, int cq, int queue_size, const char *mac,
+		     char **ifname, int server, int mrg_rxbuf, int in_order,
+		     int packed_vq, enum virtio_user_backend_type backend_type)
 {
 	uint64_t backend_features;
 	int i;
@@ -510,6 +515,11 @@ virtio_user_dev_init(struct virtio_user_dev *dev, char *path, int queues,
 	dev->backend_type = backend_type;
 
 	parse_mac(dev, mac);
+
+	if (*broker_key) {
+		dev->broker_key = *broker_key;
+		*broker_key = NULL;
+	}
 
 	if (*ifname) {
 		dev->ifname = *ifname;
@@ -595,6 +605,10 @@ virtio_user_dev_init(struct virtio_user_dev *dev, char *path, int queues,
 void
 virtio_user_dev_uninit(struct virtio_user_dev *dev)
 {
+	struct rte_eth_dev *eth_dev = &rte_eth_devices[dev->hw.port_id];
+
+	rte_eal_alarm_cancel(virtio_interrupt_handler, eth_dev);
+
 	virtio_user_stop_device(dev);
 
 	rte_mem_event_callback_unregister(VIRTIO_USER_MEM_EVENT_CLB_NAME, dev);
@@ -603,8 +617,10 @@ virtio_user_dev_uninit(struct virtio_user_dev *dev)
 
 	free(dev->ifname);
 
-	if (dev->is_server)
+	if (dev->is_server && !dev->broker_key)
 		unlink(dev->path);
+
+	free(dev->broker_key);
 
 	dev->ops->destroy(dev);
 }
@@ -929,21 +945,44 @@ virtio_user_dev_delayed_intr_reconfig_handler(void *param)
 	struct virtio_user_dev *dev = param;
 	struct rte_eth_dev *eth_dev = &rte_eth_devices[dev->hw.port_id];
 
-	PMD_DRV_LOG(DEBUG, "Unregistering intr fd: %d",
-		    eth_dev->intr_handle->fd);
+	if (rte_intr_disable(eth_dev->intr_handle) < 0) {
+		PMD_DRV_LOG(ERR, "interrupt disable failed");
+		return;
+	}
 
-	if (rte_intr_callback_unregister(eth_dev->intr_handle,
-					 virtio_interrupt_handler,
-					 eth_dev) != 1)
-		PMD_DRV_LOG(ERR, "interrupt unregister failed");
+	if (eth_dev->intr_handle->fd != -1) {
+		PMD_DRV_LOG(DEBUG, "Unregistering intr fd: %d",
+			    eth_dev->intr_handle->fd);
+
+		if (rte_intr_callback_unregister(eth_dev->intr_handle,
+						 virtio_interrupt_handler,
+						 eth_dev) != 1)
+			PMD_DRV_LOG(ERR, "interrupt unregister failed");
+	}
 
 	eth_dev->intr_handle->fd = dev->ops->get_intr_fd(dev);
 
-	PMD_DRV_LOG(DEBUG, "Registering intr fd: %d", eth_dev->intr_handle->fd);
+	rte_eal_alarm_cancel(virtio_interrupt_handler, eth_dev);
+	if (eth_dev->intr_handle->fd == -1) {
+		PMD_DRV_LOG(DEBUG, "Scheduling interrupt as alarm");
+		/*
+		 * There is no interrupt source.  Setting alarm
+		 * instead to try to re-connect later.
+		 */
+		rte_eal_alarm_set(US_PER_S, virtio_interrupt_handler,
+				  (void *)eth_dev);
+		return;
+	}
 
-	if (rte_intr_callback_register(eth_dev->intr_handle,
-				       virtio_interrupt_handler, eth_dev))
-		PMD_DRV_LOG(ERR, "interrupt register failed");
+	if (eth_dev->intr_handle->fd != -1) {
+		PMD_DRV_LOG(DEBUG, "Registering intr fd: %d",
+			    eth_dev->intr_handle->fd);
+
+		if (rte_intr_callback_register(eth_dev->intr_handle,
+					       virtio_interrupt_handler,
+					       eth_dev))
+			PMD_DRV_LOG(ERR, "interrupt register failed");
+	}
 
 	if (rte_intr_enable(eth_dev->intr_handle) < 0)
 		PMD_DRV_LOG(ERR, "interrupt enable failed");
@@ -963,6 +1002,15 @@ virtio_user_dev_server_reconnect(struct virtio_user_dev *dev)
 
 	if (dev->ops->server_reconnect(dev)) {
 		PMD_DRV_LOG(ERR, "(%s) Reconnect callback call failed", dev->path);
+		if (dev->broker_key) {
+			/*
+			 * We might need to re-establish broker connection, so
+			 * we need to re-configure interrupts for it.
+			 */
+			rte_eal_alarm_set(1,
+				virtio_user_dev_delayed_intr_reconfig_handler,
+				(void *)dev);
+		}
 		return -1;
 	}
 
@@ -1010,10 +1058,6 @@ virtio_user_dev_server_reconnect(struct virtio_user_dev *dev)
 		}
 	}
 	if (eth_dev->data->dev_flags & RTE_ETH_DEV_INTR_LSC) {
-		if (rte_intr_disable(eth_dev->intr_handle) < 0) {
-			PMD_DRV_LOG(ERR, "interrupt disable failed");
-			return -1;
-		}
 		/*
 		 * This function can be called from the interrupt handler, so
 		 * we can't unregister interrupt handler here.  Setting
