@@ -130,6 +130,16 @@ The following is an overview of some key Vhost API functions:
 
     It is disabled by default.
 
+  - ``RTE_VHOST_USER_SOCKETPAIR_BROKER``
+
+    Enabling of this flag makes vhost library to treat socket ``path`` as a
+    path to SocketPair Broker.  In this case ``path`` should include
+    ``,broker-key=<key>`` after the actual broker's socket path.  ``<key>``
+    will be used as a broker key, so it will be able to connect 2 processes
+    that provided the same key.
+
+    Incompatible with ``RTE_VHOST_USER_NO_RECONNECT``.
+
 * ``rte_vhost_driver_set_features(path, features)``
 
   This function sets the feature bits the vhost-user driver supports. The

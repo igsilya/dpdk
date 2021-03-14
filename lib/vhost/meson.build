@@ -15,6 +15,13 @@ elif (toolchain == 'clang' and cc.version().version_compare('>=3.7.0'))
 elif (toolchain == 'icc' and cc.version().version_compare('>=16.0.0'))
     cflags += '-DVHOST_ICC_UNROLL_PRAGMA'
 endif
+
+spbroker_dep = dependency('spbroker', required: false)
+if spbroker_dep.found()
+        dpdk_conf.set('RTE_LIBRTE_VHOST_SOCKETPAIR_BROKER', 1)
+        ext_deps += spbroker_dep
+endif
+
 dpdk_conf.set('RTE_LIBRTE_VHOST_POSTCOPY', cc.has_header('linux/userfaultfd.h'))
 cflags += '-fno-strict-aliasing'
 sources = files(
