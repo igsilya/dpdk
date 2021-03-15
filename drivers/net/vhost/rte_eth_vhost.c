@@ -27,6 +27,7 @@ RTE_LOG_REGISTER_DEFAULT(vhost_logtype, NOTICE);
 enum {VIRTIO_RXQ, VIRTIO_TXQ, VIRTIO_QNUM};
 
 #define ETH_VHOST_IFACE_ARG		"iface"
+#define ETH_VHOST_BROKER_KEY_ARG	"broker-key"
 #define ETH_VHOST_QUEUES_ARG		"queues"
 #define ETH_VHOST_CLIENT_ARG		"client"
 #define ETH_VHOST_IOMMU_SUPPORT		"iommu-support"
@@ -38,6 +39,7 @@ enum {VIRTIO_RXQ, VIRTIO_TXQ, VIRTIO_QNUM};
 
 static const char *valid_arguments[] = {
 	ETH_VHOST_IFACE_ARG,
+	ETH_VHOST_BROKER_KEY_ARG,
 	ETH_VHOST_QUEUES_ARG,
 	ETH_VHOST_CLIENT_ARG,
 	ETH_VHOST_IOMMU_SUPPORT,
@@ -104,6 +106,7 @@ struct vhost_queue {
 struct pmd_internal {
 	rte_atomic32_t dev_attached;
 	char *iface_name;
+	char *broker_key;
 	uint64_t flags;
 	uint64_t disable_flags;
 	uint16_t max_queues;
@@ -1403,14 +1406,15 @@ static const struct eth_dev_ops ops = {
 
 static int
 eth_dev_vhost_create(struct rte_vdev_device *dev, char *iface_name,
-	int16_t queues, const unsigned int numa_node, uint64_t flags,
-	uint64_t disable_flags)
+	char *broker_key, int16_t queues, const unsigned int numa_node,
+	uint64_t flags, uint64_t disable_flags)
 {
 	const char *name = rte_vdev_device_name(dev);
 	struct rte_eth_dev_data *data;
 	struct pmd_internal *internal = NULL;
 	struct rte_eth_dev *eth_dev = NULL;
 	struct rte_ether_addr *eth_addr = NULL;
+	int iface_name_len, name_len;
 
 	VHOST_LOG(INFO, "Creating VHOST-USER backend on numa socket %u\n",
 		numa_node);
@@ -1434,11 +1438,22 @@ eth_dev_vhost_create(struct rte_vdev_device *dev, char *iface_name,
 	 * - and point eth_dev structure to new eth_dev_data structure
 	 */
 	internal = eth_dev->data->dev_private;
-	internal->iface_name = rte_malloc_socket(name, strlen(iface_name) + 1,
+
+	iface_name_len = strlen(iface_name);
+	name_len = iface_name_len;
+	if (broker_key)
+		name_len += strlen(broker_key) + 12;
+
+	internal->iface_name = rte_malloc_socket(name, name_len + 1,
 						 0, numa_node);
 	if (internal->iface_name == NULL)
 		goto error;
+
 	strcpy(internal->iface_name, iface_name);
+	if (broker_key) {
+		strcpy(internal->iface_name + iface_name_len, ",broker-key=");
+		strcpy(internal->iface_name + iface_name_len + 12, broker_key);
+	}
 
 	data->nb_rx_queues = queues;
 	data->nb_tx_queues = queues;
@@ -1471,14 +1486,14 @@ error:
 }
 
 static inline int
-open_iface(const char *key __rte_unused, const char *value, void *extra_args)
+open_str(const char *key __rte_unused, const char *value, void *extra_args)
 {
-	const char **iface_name = extra_args;
+	const char **str = extra_args;
 
 	if (value == NULL)
 		return -1;
 
-	*iface_name = value;
+	*str = value;
 
 	return 0;
 }
@@ -1504,6 +1519,7 @@ rte_pmd_vhost_probe(struct rte_vdev_device *dev)
 	struct rte_kvargs *kvlist = NULL;
 	int ret = 0;
 	char *iface_name;
+	char *broker_key = NULL;
 	uint16_t queues;
 	uint64_t flags = RTE_VHOST_USER_NET_COMPLIANT_OL_FLAGS;
 	uint64_t disable_flags = 0;
@@ -1540,12 +1556,22 @@ rte_pmd_vhost_probe(struct rte_vdev_device *dev)
 
 	if (rte_kvargs_count(kvlist, ETH_VHOST_IFACE_ARG) == 1) {
 		ret = rte_kvargs_process(kvlist, ETH_VHOST_IFACE_ARG,
-					 &open_iface, &iface_name);
+					 &open_str, &iface_name);
 		if (ret < 0)
 			goto out_free;
 	} else {
 		ret = -1;
 		goto out_free;
+	}
+
+	if (rte_kvargs_count(kvlist, ETH_VHOST_BROKER_KEY_ARG) == 1) {
+		ret = rte_kvargs_process(kvlist, ETH_VHOST_BROKER_KEY_ARG,
+					 &open_str, &broker_key);
+		if (ret < 0)
+			goto out_free;
+
+		if (broker_key)
+			flags |= RTE_VHOST_USER_SOCKETPAIR_BROKER;
 	}
 
 	if (rte_kvargs_count(kvlist, ETH_VHOST_QUEUES_ARG) == 1) {
@@ -1625,7 +1651,7 @@ rte_pmd_vhost_probe(struct rte_vdev_device *dev)
 	if (dev->device.numa_node == SOCKET_ID_ANY)
 		dev->device.numa_node = rte_socket_id();
 
-	ret = eth_dev_vhost_create(dev, iface_name, queues,
+	ret = eth_dev_vhost_create(dev, iface_name, broker_key, queues,
 				   dev->device.numa_node, flags, disable_flags);
 	if (ret == -1)
 		VHOST_LOG(ERR, "Failed to create %s\n", name);

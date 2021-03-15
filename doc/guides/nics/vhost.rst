@@ -34,6 +34,11 @@ The user can specify below arguments in `--vdev` option.
 
     It is used to specify a path to connect to a QEMU virtio-net device.
 
+#.  ``broker-key``:
+
+    It is used to specify that ``iface`` points to a SocketPair Broker and
+    value is used as a pairing key.
+
 #.  ``queues``:
 
     It is used to specify the number of queues virtio-net device has.
