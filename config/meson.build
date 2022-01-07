@@ -251,6 +251,7 @@ warning_flags = [
         '-Wextra',
 
         # additional warnings in alphabetical order
+        '-Wcast-align',
         '-Wcast-qual',
         '-Wdeprecated',
         '-Wformat',
